@@ -1,0 +1,233 @@
+version: '3.8'
+
+services:
+  # 1. Zookeeper (Required for Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - stock_market
+    restart: always # Added restart policy for robust operation
+
+  # 2. Kafka Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    hostname: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - '9094:9094'
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # FIX: Define both internal (PLAINTEXT:29092) and external (EXTERNAL:9094) listeners
+      KAFKA_LISTENERS: PLAINTEXT://:29092,EXTERNAL://:9094
+      # FIX: Advertise internal address for Docker network and external address using host.docker.internal for host access
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://host.docker.internal:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # IMPORTANT FIX for Persistence: Explicitly set the log directory to use the volume
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - stock_market
+    healthcheck:
+      # FIX: Changed internal port from 9092 to the configured internal port 29092
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:29092"]
+      interval: 10s
+      retries: 5
+      # FIX: Increased startup period for reliability
+      start_period: 60s
+      timeout: 10s
+    restart: always # Added restart policy
+
+  # 3. KAFKA TOPIC CREATOR
+  kafka-topic-creator:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-topic-creator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - stock_market
+    command: >
+      /bin/sh -c "
+      TOPIC='stock_data'
+      # FIX: Changed bootstrap server port from 9092 to the configured internal port 29092
+      BOOTSTRAP_SERVER='kafka:29092'
+      echo 'Creating $$TOPIC topic...' &&
+      kafka-topics --create --if-not-exists --topic $$TOPIC --bootstrap-server $$BOOTSTRAP_SERVER --partitions 1 --replication-factor 1 &&
+      echo 'Waiting for topic $$TOPIC metadata to propagate...' &&
+      TRIES=0
+      MAX_TRIES=15
+      while [ $$TRIES -lt $$MAX_TRIES ]; do
+        if kafka-topics --list --bootstrap-server $$BOOTSTRAP_SERVER | grep -q $$TOPIC; then
+          echo 'Topic $$TOPIC found and ready.'
+          exit 0
+        fi
+        echo 'Topic $$TOPIC not yet available. Waiting 2s...'
+        sleep 2
+        TRIES=$$((TRIES + 1))
+      done
+      echo 'Error: Topic $$TOPIC not ready after $$MAX_TRIES attempts.'
+      exit 1
+      "
+    restart: on-failure # Added restart policy
+
+  # 4. SPARK MASTER
+  spark-master:
+    image: yiwen/spark:v3.5.1-py3
+    container_name: spark-master
+    command: ["/bin/bash", "-c", "/opt/spark/sbin/start-master.sh && tail -f /dev/null"]
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - spark_data:/bitnami
+      - ./apps:/opt/spark-apps
+      - ./data:/opt/spark-data
+    networks:
+      - stock_market
+    restart: always # Added restart policy
+
+  # 5. SPARK WORKER
+  spark-worker:
+    image: yiwen/spark:v3.5.1-py3
+    container_name: spark-worker
+    command: ["/bin/bash", "-c", "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /dev/null"]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - spark_data:/bitnami
+      - ./apps:/opt/spark-apps
+      - ./data:/opt/spark-data
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"
+    networks:
+      - stock_market
+    restart: always # Added restart policy
+
+  # 6. POSTGRES DATABASE
+  postgres:
+    image: postgres:16.9
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: market_pulse
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - stock_market
+
+  # 7. PGADMIN (POSTGRESQL WEB UI)
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - stock_market
+    depends_on:
+      - postgres
+
+  ### 8. PYTHON PRODUCER (FIXED) ###
+  app-producer:
+    build: .
+    container_name: stock-producer
+    depends_on:
+      - spark-master # Depends on spark-master because it's a spark job
+      - kafka-topic-creator
+    networks:
+      - stock_market
+    volumes:
+      - ./apps:/app
+      - spark_cache:/home/spark/.ivy2 # Cache for dependencies
+    user: root
+    # CRITICAL FIX: Use spark-submit and --packages to inject the Kafka connector JAR
+    command: >
+      /bin/sh -c "chown -R 185:185 /home/spark/.ivy2 || echo 'Could not chown /home/spark/.ivy2, continuing...' &&
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      /app/producer.py"
+    restart: on-failure # Added restart policy
+
+  # 9. SPARK CONSUMER
+  app-consumer:
+    build: .
+    container_name: stock-consumer
+    depends_on:
+      - spark-master
+      - kafka-topic-creator
+    networks:
+      - stock_market
+    volumes:
+      - ./apps:/app
+      - spark_cache:/home/spark/.ivy2
+    user: root
+    command: >
+      /bin/sh -c "chown -R 185:185 /home/spark/.ivy2 || echo 'Could not chown /home/spark/.ivy2, continuing...' &&
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      /app/consumer_spark.py"
+    restart: on-failure # Added restart policy
+
+  # 10. SPARK DB LOADER
+  app-db-loader:
+    build: .
+    container_name: stock-db-loader
+    depends_on:
+      - spark-master
+      - postgres
+      - kafka-topic-creator
+    networks:
+      - stock_market
+    volumes:
+      - ./apps:/app
+      - spark_cache:/home/spark/.ivy2
+    user: root
+    command: >
+      /bin/sh -c "chown -R 185:185 /home/spark/.ivy2 || echo 'Could not chown /home/spark/.ivy2, continuing...' &&
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+      /app/db_loader.py"
+    restart: on-failure # Added restart policy
+
+volumes:
+  postgres_data:
+  spark_data:
+  kafka_data:
+  spark_cache:
+
+networks:
+  stock_market:
+    driver: bridge
